@@ -257,31 +257,56 @@ function Get-ProcessCpuUsage {
     $maxSamples = [Math]::Max(2, [Math]::Floor($DurationSeconds / $IntervalSeconds))
     $pidTotals = @{}
     $pidCounts = @{}
+    $goodSamples = 0
+    $badSamples = 0
+    $lastError = $null
 
-    try {
-        Write-Status "  sampling live CPU via Get-Counter ($maxSamples samples, ${IntervalSeconds}s apart)..."
-        $sampleSets = Get-Counter -Counter '\Process(*)\% Processor Time', '\Process(*)\ID Process' `
-            -SampleInterval $IntervalSeconds -MaxSamples $maxSamples -ErrorAction Stop
+    Write-Status "  sampling live CPU via Get-Counter ($maxSamples samples, ${IntervalSeconds}s apart)..."
 
-        foreach ($set in $sampleSets) {
-            $idMap = @{}
-            foreach ($s in $set.CounterSamples) {
-                if ($s.Path -like '*\id process') { $idMap[$s.InstanceName] = [int]$s.CookedValue }
-            }
-            foreach ($s in $set.CounterSamples) {
-                if ($s.Path -like '*\% processor time' -and $s.InstanceName -notin @('_total', 'idle')) {
-                    if ($idMap.ContainsKey($s.InstanceName)) {
-                        $procId = $idMap[$s.InstanceName]
-                        if (-not $pidTotals.ContainsKey($procId)) { $pidTotals[$procId] = 0.0; $pidCounts[$procId] = 0 }
-                        $pidTotals[$procId] += $s.CookedValue
-                        $pidCounts[$procId] += 1
+    # Sampled one interval at a time (rather than one batched -MaxSamples call) because
+    # \Process(*) wildcards intermittently return "The data in one of the performance
+    # counter samples is not valid" -- observed here to fail 40-70% of individual calls,
+    # seemingly at random (likely PPL-protected AV/EDR processes or plain process churn
+    # on a security-tool-heavy box). A batched -MaxSamples call throws away the ENTIRE
+    # window on a single bad instance; isolating each interval -- with a couple of quick
+    # retries, since a retry usually succeeds -- means one bad read only costs that read.
+    $maxRetries = 6
+    for ($i = 0; $i -lt $maxSamples; $i++) {
+        $ok = $false
+        for ($attempt = 1; $attempt -le $maxRetries -and -not $ok; $attempt++) {
+            try {
+                $set = Get-Counter -Counter '\Process(*)\% Processor Time', '\Process(*)\ID Process' `
+                    -SampleInterval $IntervalSeconds -MaxSamples 1 -ErrorAction Stop
+
+                $idMap = @{}
+                foreach ($s in $set.CounterSamples) {
+                    if ($s.Path -like '*\id process' -and $s.Status -eq 0) { $idMap[$s.InstanceName] = [int]$s.CookedValue }
+                }
+                foreach ($s in $set.CounterSamples) {
+                    if ($s.Path -like '*\% processor time' -and $s.Status -eq 0 -and $s.InstanceName -notin @('_total', 'idle')) {
+                        if ($idMap.ContainsKey($s.InstanceName)) {
+                            $procId = $idMap[$s.InstanceName]
+                            if (-not $pidTotals.ContainsKey($procId)) { $pidTotals[$procId] = 0.0; $pidCounts[$procId] = 0 }
+                            $pidTotals[$procId] += $s.CookedValue
+                            $pidCounts[$procId] += 1
+                        }
                     }
                 }
+                $goodSamples++
+                $ok = $true
+            } catch {
+                $lastError = $_
             }
         }
-    } catch {
-        Add-CollectionWarning "Get-Counter sampling failed ($($_.Exception.Message)); used processor-time delta fallback instead (less precise, single before/after snapshot)."
+        if (-not $ok) { $badSamples++ }
+    }
+
+    if ($goodSamples -eq 0) {
+        Add-CollectionWarning "Get-Counter sampling failed on all $maxSamples samples ($($lastError.Exception.Message)); used processor-time delta fallback instead (less precise, single before/after snapshot)."
         return Get-ProcessCpuUsageFallback -DurationSeconds $DurationSeconds
+    }
+    if ($badSamples -gt 0) {
+        Add-CollectionWarning "Get-Counter: $badSamples of $maxSamples samples were discarded (invalid counter data, likely process churn); averages are based on the remaining $goodSamples sample(s)."
     }
 
     $results = New-Object System.Collections.Generic.List[object]
